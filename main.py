@@ -444,6 +444,47 @@ antilink_channels_map = {}  # {guild_id: set(channel_id, ...)}  — channels ant
 antiswear_guilds = {}  # {guild_id: True/False}  — anti-swear toggle per server
 antiswear_words_map = {}  # {guild_id: set(word, ...)}  — banned words per server
 antiswear_channels_map = {}  # {guild_id: set(channel_id, ...)}  — channels antiswear is scoped to (empty = all channels)
+_antiswear_regex_cache = {}  # {frozenset(words): compiled regex}  — avoids recompiling every message
+
+
+def _find_banned_word(content: str, banned_words) -> str | None:
+    """Return the first configured banned word/phrase found in `content`, or None.
+
+    Supports an unlimited number of banned words/phrases per guild (not just one).
+    Each entry is matched as a whole word/phrase (word-boundary aware) so short
+    entries like "ass" don't false-positive on "class", and multi-word phrases
+    like "bad word" are matched too. Matching is case-insensitive and also
+    catches the word with spaces/punctuation stripped out (e.g. "b a d" or
+    "b.a.d") to catch simple spacing/punctuation evasion.
+    """
+    if not content or not banned_words:
+        return None
+
+    words = tuple(sorted((w for w in banned_words if w and w.strip()), key=len, reverse=True))
+    if not words:
+        return None
+
+    key = words
+    pattern = _antiswear_regex_cache.get(key)
+    if pattern is None:
+        alternatives = "|".join(re.escape(w.lower()) for w in words)
+        pattern = re.compile(r"(?<![a-z0-9])(" + alternatives + r")(?![a-z0-9])", re.IGNORECASE)
+        _antiswear_regex_cache[key] = pattern
+
+    content_lower = content.lower()
+    match = pattern.search(content_lower)
+    if match:
+        return match.group(1)
+
+    # Fallback: catch words split up with spaces/punctuation (e.g. "b a d word").
+    stripped = re.sub(r"[\s\W]+", "", content_lower)
+    for w in words:
+        w_stripped = re.sub(r"[\s\W]+", "", w.lower())
+        if w_stripped and w_stripped in stripped:
+            return w
+    return None
+
+
 afk_go_text_map = {}  # {guild_id: custom "gone AFK" sentence template}
 staff_daily_text_map = {}  # {guild_id: {"title": str, "description": str}}
 staff_daily_channels = {}  # {guild_id: channel_id}  — where daily ping is sent
@@ -2000,8 +2041,7 @@ async def on_message(message):
         scoped_swear_channels = antiswear_channels_map.get(gid_str, set())
         in_swear_scope = (not scoped_swear_channels) or (message.channel.id in scoped_swear_channels)
         if banned_words and in_swear_scope:
-            content_lower = message.content.lower()
-            matched_word = next((w for w in banned_words if w and w in content_lower), None)
+            matched_word = _find_banned_word(message.content, banned_words)
             if matched_word:
                 has_exempt = any(
                     r.permissions.manage_messages or r.permissions.administrator
@@ -5762,14 +5802,21 @@ async def mute_error(ctx, error):
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("Usage: $mute @member [minutes] [reason] | بەکارهێنان: $mute @ئەندام [خولەک] [هۆکار]")
 
-@bot.command()
+@bot.command(aliases=["untimeout", "unmute_", "unt"])
 @commands.has_permissions(moderate_members=True)
-async def unmute(ctx, member: discord.Member):
+async def unmute(ctx, member: discord.Member = None):
+    if member is None:
+        return await ctx.send("Usage: `!untimeout @member` (also works as `!unmute @member`) | بەکارهێنان: `!untimeout @ئەندام`")
+    if member.timed_out_until is None:
+        await ctx.send(f"{member.mention} isn't timed out. | {member.mention} بێدەنگ نەکراوە.")
+        return
     try:
-        await member.timeout(None)
-        await ctx.send(f"Unmuted {member.mention}. | بێدەنگیی {member.mention} لادرا.")
+        await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
+        await ctx.send(f"Removed timeout from {member.mention}. | بێدەنگیی {member.mention} لادرا.")
     except discord.Forbidden:
         await ctx.send("I don't have permission to remove the timeout. | مووچەم نییە بێدەنگیەکە لابدەم.")
+    except discord.HTTPException as e:
+        await ctx.send(f"Failed to remove the timeout: {e} | نەتوانرا بێدەنگیەکە لابدرێت.")
 
 @unmute.error
 async def unmute_error(ctx, error):
@@ -5778,7 +5825,7 @@ async def unmute_error(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("Member not found. | ئەندام نەدۆزرایەوە.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Usage: $unmute @member | بەکارهێنان: $unmute @ئەندام")
+        await ctx.send("Usage: `!untimeout @member` | بەکارهێنان: `!untimeout @ئەندام`")
 
 @bot.command()
 @commands.has_permissions(kick_members=True)
@@ -12031,6 +12078,113 @@ async def setantichannel_cmd(ctx, channel: discord.TextChannel = None):
         description=f"{desc}\n\n**کەناڵی ئێستا | Current scope:** {scope_text}",
     )
     await ctx.send(embed=embed)
+
+
+@bot.command(name="addword", aliases=["addbannedword", "addswearword"])
+@commands.has_permissions(manage_guild=True)
+async def addword_cmd(ctx, *, words: str = None):
+    """Add one or more banned words/phrases. Separate multiple with commas.
+    Usage: !addword badword1, badword2, some phrase
+    """
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    if not words:
+        return await ctx.send(
+            "Usage: `!addword word1, word2, some phrase` (you can add as many as you want, comma-separated). | "
+            "بەکارهێنان: `!addword وشە١, وشە٢, ڕستەیەک`"
+        )
+    gid = str(ctx.guild.id)
+    new_words = [w.strip() for w in words.split(",") if w.strip()]
+    if not new_words:
+        return await ctx.send("No valid words found. | هیچ وشەیەکی دروست نەدۆزرایەوە.")
+    current = set(antiswear_words_map.get(gid, set()))
+    current.update(new_words)
+    save_antiswear_words(gid, current)
+    if not antiswear_guilds.get(gid, False):
+        save_antiswear_enabled(gid, True)
+    total = len(antiswear_words_map.get(gid, set()))
+    added_list = ", ".join(f"`{w}`" for w in new_words)
+    await ctx.send(
+        f"✅ Added {len(new_words)} word(s)/phrase(s): {added_list}\n"
+        f"Total banned words for this server: **{total}**. | "
+        f"وشە/ڕستە زیادکرا. کۆی گشتی: {total}"
+    )
+
+
+@addword_cmd.error
+async def addword_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="removeword", aliases=["removebannedword", "removeswearword", "delword"])
+@commands.has_permissions(manage_guild=True)
+async def removeword_cmd(ctx, *, words: str = None):
+    """Remove one or more banned words/phrases. Separate multiple with commas."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    if not words:
+        return await ctx.send("Usage: `!removeword word1, word2` | بەکارهێنان: `!removeword وشە١, وشە٢`")
+    gid = str(ctx.guild.id)
+    to_remove = {w.strip().lower() for w in words.split(",") if w.strip()}
+    current = set(antiswear_words_map.get(gid, set()))
+    removed = current & to_remove
+    current -= to_remove
+    save_antiswear_words(gid, current)
+    total = len(antiswear_words_map.get(gid, set()))
+    if removed:
+        removed_list = ", ".join(f"`{w}`" for w in sorted(removed))
+        await ctx.send(f"✅ Removed: {removed_list}\nRemaining banned words: **{total}**.")
+    else:
+        await ctx.send("None of those words were in the list. | هیچکام لەو وشەکان لە لیستەکەدا نەبوون.")
+
+
+@removeword_cmd.error
+async def removeword_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="listwords", aliases=["listbannedwords", "swearwords"])
+@commands.has_permissions(manage_guild=True)
+async def listwords_cmd(ctx):
+    """List every configured banned word/phrase for this server."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    words = sorted(antiswear_words_map.get(gid, set()))
+    if not words:
+        return await ctx.send("No banned words configured yet. Use `!addword word1, word2` to add some. | هیچ وشەیەک زیاد نەکراوە.")
+    listing = "\n".join(f"• {w}" for w in words)
+    embed = discord.Embed(
+        color=0x5865F2,
+        title=f"🚫 Banned Words ({len(words)})",
+        description=listing[:4000],
+    )
+    await ctx.send(embed=embed)
+
+
+@listwords_cmd.error
+async def listwords_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
+
+
+@bot.command(name="clearwords", aliases=["clearbannedwords"])
+@commands.has_permissions(manage_guild=True)
+async def clearwords_cmd(ctx):
+    """Remove ALL configured banned words for this server."""
+    if ctx.guild is None:
+        return await ctx.send("Server only. | تەنها لە سێرڤەر.")
+    gid = str(ctx.guild.id)
+    save_antiswear_words(gid, set())
+    await ctx.send("✅ Cleared the banned word list. | لیستەی وشەکان سڕایەوە.")
+
+
+@clearwords_cmd.error
+async def clearwords_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ مووچەی بەڕێوەبردنی سێرڤەر پێویستە. | You need the Manage Server permission.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
